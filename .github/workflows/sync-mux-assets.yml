@@ -1,29 +1,28 @@
-name: Sync Mux Assets & Audio Intensity
+name: Sync Mux assets
 
 on:
   schedule:
-    - cron: "0 */6 * * *"
-  workflow_dispatch:
+    - cron: '*/15 * * * *'
+  workflow_dispatch: {}
 
 permissions:
   contents: write
 
 concurrency:
-  group: sync-mux
+  group: sync-mux-assets
   cancel-in-progress: false
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: '20'
 
       - name: Fetch Mux assets
         env:
@@ -31,12 +30,41 @@ jobs:
           MUX_TOKEN_SECRET: ${{ secrets.MUX_TOKEN_SECRET }}
         run: node scripts/fetch-assets.js
 
+      - name: Check for unanalyzed videos
+        id: check
+        run: |
+          node - <<'EOF'
+          const fs = require('fs');
+          const path = require('path');
+
+          const data = JSON.parse(fs.readFileSync('public/assets.json', 'utf8'));
+          const videos = data.videos || [];
+          const outDir = 'public/intensity';
+          fs.mkdirSync(outDir, { recursive: true });
+
+          const validIds = new Set(videos.map(v => v.playbackId).filter(Boolean));
+          for (const file of fs.readdirSync(outDir)) {
+            if (file.endsWith('.json') && !validIds.has(file.slice(0, -5))) {
+              fs.unlinkSync(path.join(outDir, file));
+              console.log(`Pruned ${file}`);
+            }
+          }
+
+          const missing = videos.filter(
+            v => v.playbackId && !fs.existsSync(path.join(outDir, `${v.playbackId}.json`))
+          );
+          console.log(`Unanalyzed videos: ${missing.length}`);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `needs_analysis=${missing.length > 0}\n`);
+          EOF
+
       - name: Setup Python
+        if: steps.check.outputs.needs_analysis == 'true'
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: '3.12'
 
       - name: Cache YAMNet model and pip wheels
+        if: steps.check.outputs.needs_analysis == 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -45,21 +73,20 @@ jobs:
           key: yamnet-pip-v1
 
       - name: Install ffmpeg and Python packages
+        if: steps.check.outputs.needs_analysis == 'true'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg
           pip install -q ai-edge-litert numpy scipy
 
       - name: Analyze new videos
-        run: python scripts/analyze-audio.py --max-per-run 15 --prune
+        if: steps.check.outputs.needs_analysis == 'true'
+        run: python scripts/analyze-audio.py --max-per-run 15
 
-      - name: Commit and push updates
+      - name: Commit and push if changed
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "mux-sync-bot"
+          git config user.email "actions@users.noreply.github.com"
           git add public/
-          if ! git diff --cached --quiet; then
-            git commit -m "Sync Mux assets and audio intensity"
-            git push
-          fi
-
+          git diff --cached --quiet && echo "No changes" || git commit -m "Sync Mux assets [skip ci]"
+          git push
