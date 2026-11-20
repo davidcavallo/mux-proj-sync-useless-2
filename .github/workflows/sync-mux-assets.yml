@@ -31,3 +31,4 @@
           git add public/assets.json public/intensity/
           git diff --cached --quiet || git commit -m "Sync Mux assets + audio intensity"
           git push
+
