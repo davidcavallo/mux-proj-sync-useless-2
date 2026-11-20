@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '*/15 * * * *'
   workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/**'
+      - '.github/workflows/**'
 
 permissions:
   contents: write
@@ -78,6 +83,10 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg
           pip install -q ai-edge-litert numpy scipy
+
+      - name: Analyze new videos
+        if: steps.check.outputs.needs_analysis == 'true'
+        run: python -u scripts/analyze-audio.py --max-per-run 8
 
       - name: Commit and push if changed
         run: |
