@@ -62,3 +62,4 @@ jobs:
             git commit -m "Sync Mux assets and audio intensity"
             git push
           fi
+
