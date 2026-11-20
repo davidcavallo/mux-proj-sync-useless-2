@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """
-Incremental Option D audio intensity analyzer for Mux assets.
-Reads public/assets.json, skips already-processed videos, and writes
-public/intensity/<playbackId>.json.
+Incremental Option D+ audio intensity analyzer for Mux assets.
+Combines YAMNet vocal event tagging with DSP features:
+  - Sustained voice-band loudness (200-3500 Hz)
+  - Pitch height + voicing strength (vectorized autocorrelation)
+  - Voicing-gated spectral centroid / brightness
+  - Low-mid rhythmic periodicity (envelope onset autocorrelation, 0.8-5 Hz) + flux density
+  - Multi-second continuity boost + spike rejection
+Outputs 2 Hz compact JSON to public/intensity/<playbackId>.json.
 """
 import argparse
 import json
@@ -13,7 +18,7 @@ from pathlib import Path
 
 import numpy as np
 from ai_edge_litert.interpreter import Interpreter
-from scipy.ndimage import gaussian_filter1d, median_filter
+from scipy.ndimage import gaussian_filter1d, median_filter, uniform_filter1d
 from scipy.signal import butter, find_peaks, sosfiltfilt
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -25,20 +30,15 @@ MODEL_URL = "https://storage.googleapis.com/mediapipe-models/audio_classifier/ya
 LABELS_URL = "https://storage.googleapis.com/mediapipe-tasks/audio_classifier/yamnet_label_list.txt"
 
 SR = 16000
-SCHEMA_VERSION = 1
+OUT_HZ = 2  # 2 points/sec (0.5s resolution) for crisp scrubbing
+SCHEMA_VERSION = 2
 
-# Tiered weights for AudioSet/YAMNet classes:
-# Strong non-speech vocal reactions rank highest; calm speech ranks lower;
-# background noise/music/rustling is penalized.
 VOCAL_WEIGHTS = {
-    # High-energy / intense vocalizations
     "Shout": 1.0, "Yell": 1.0, "Bellow": 1.0, "Whoop": 1.0, "Screaming": 1.0,
     "Cheering": 1.0, "Groan": 1.0, "Grunt": 1.0, "Gasp": 1.0, "Pant": 1.0,
     "Wail, moan": 1.0, "Whimper": 0.9, "Laughter": 0.85, "Giggle": 0.8,
     "Crying, sobbing": 0.8,
-    # Moderate vocal/breathing cues
     "Breathing": 0.65, "Sigh": 0.6, "Snort": 0.55, "Chuckle, chortle": 0.6,
-    # Regular talking (kept lower so calm commentary doesn't overshadow peaks)
     "Speech": 0.25, "Conversation": 0.2, "Chatter": 0.2, "Whispering": 0.15,
 }
 
@@ -63,7 +63,7 @@ def ensure_model():
 
 def robust_norm(x, low=5.0, high=97.0):
     if len(x) == 0:
-        return x
+        return x.astype(np.float32)
     lo, hi = np.percentile(x, [low, high])
     if hi - lo < 1e-8:
         return np.zeros_like(x, dtype=np.float32)
@@ -71,7 +71,7 @@ def robust_norm(x, low=5.0, high=97.0):
 
 
 def fetch_audio_pcm(playback_id: str) -> np.ndarray:
-    """Stream 16kHz mono float32 PCM from Mux audio-only endpoint (with HLS fallback)."""
+    """Stream 16kHz mono float32 PCM directly from Mux audio endpoint."""
     urls = [
         (f"https://stream.mux.com/{playback_id}/audio.m4a", []),
         (f"https://stream.mux.com/{playback_id}.m3u8", ["-map", "0:a:0"]),
@@ -90,13 +90,12 @@ def fetch_audio_pcm(playback_id: str) -> np.ndarray:
     raise RuntimeError(f"ffmpeg failed for {playback_id}: {last_err}")
 
 
-def compute_yamnet_vocal(audio: np.ndarray, interpreter: Interpreter, labels: list[str], n_sec: int) -> np.ndarray:
+def compute_yamnet_vocal(audio: np.ndarray, interpreter: Interpreter, labels: list[str], t_grid: np.ndarray) -> np.ndarray:
     inp = interpreter.get_input_details()[0]
     out = interpreter.get_output_details()[0]
-    win_len = int(inp["shape"][-1])  # 15600 samples (0.975s) for MediaPipe YAMNet
+    win_len = int(inp["shape"][-1])  # 15600 samples (~0.975s)
     hop_len = SR // 2                # 0.5s hop (2 Hz)
 
-    # Precompute weight vectors across the 521 classes
     w_vocal = np.zeros(len(labels), dtype=np.float32)
     w_penalty = np.zeros(len(labels), dtype=np.float32)
     for idx, name in enumerate(labels):
@@ -106,7 +105,7 @@ def compute_yamnet_vocal(audio: np.ndarray, interpreter: Interpreter, labels: li
             w_penalty[idx] = 1.0
 
     times = []
-    raw_scores = []
+    scores = []
 
     for start in range(0, len(audio), hop_len):
         chunk = audio[start : start + win_len]
@@ -117,99 +116,198 @@ def compute_yamnet_vocal(audio: np.ndarray, interpreter: Interpreter, labels: li
         interpreter.invoke()
         probs = interpreter.get_tensor(out["index"]).flatten()
 
-        # Combine strongest vocal cue with total vocal probability; dampen music/noise
         vocal_peak = float(np.max(probs * w_vocal))
         vocal_sum = float(np.clip(np.sum(probs * w_vocal), 0.0, 1.5))
         noise_pen = float(np.clip(np.sum(probs * w_penalty), 0.0, 1.0))
 
         v = (0.65 * vocal_peak + 0.35 * min(vocal_sum, 1.0)) * (1.0 - 0.65 * noise_pen)
         times.append((start + win_len * 0.5) / SR)
-        raw_scores.append(v)
+        scores.append(v)
 
-    t_grid = np.arange(n_sec, dtype=np.float32) + 0.5
-    vocal_1hz = np.interp(t_grid, times, raw_scores).astype(np.float32)
-    # 3-second rolling median rejects single-frame misclassifications
-    return median_filter(vocal_1hz, size=3)
+    y_2hz = np.interp(t_grid, times, scores).astype(np.float32)
+    return median_filter(y_2hz, size=3)  # 1.5s median kills single-frame blips
 
 
-def compute_dsp_features(audio: np.ndarray, n_sec: int):
-    # 1. Sustained vocal-band loudness (200 - 3500 Hz)
-    sos_v = butter(4, [200, 3500], btype="bandpass", fs=SR, output="sos")
-    vocal_band = sosfiltfilt(sos_v, audio).astype(np.float32)
+def compute_vocal_dsp(audio: np.ndarray, t_grid: np.ndarray):
+    """
+    Computes at 20 Hz (then pooled to OUT_HZ):
+      - Sustained voice-band loudness (200-3500 Hz)
+      - Voicing strength (harmonicity via normalized autocorrelation)
+      - Pitch height (100-695 Hz, credited when voiced)
+      - Spectral centroid / brightness (200-3800 Hz)
+    """
+    sos_v = butter(4, [150, 3800], btype="bandpass", fs=SR, output="sos")
+    v_audio = sosfiltfilt(sos_v, audio).astype(np.float32)
 
-    # Compute 20 Hz RMS -> log-compress -> 3s rolling median (kills isolated bangs)
-    step_20hz = SR // 20
-    n_frames = len(vocal_band) // step_20hz
-    rms_20hz = np.sqrt(
-        np.mean(vocal_band[: n_frames * step_20hz].reshape(n_frames, step_20hz) ** 2, axis=1) + 1e-10
-    )
-    sustained_loud_20hz = median_filter(np.log1p(rms_20hz * 25.0), size=60)  # 3s median
-    t_20 = (np.arange(n_frames) + 0.5) / 20.0
-    t_1 = np.arange(n_sec, dtype=np.float32) + 0.5
-    vocal_loud_1hz = robust_norm(np.interp(t_1, t_20, sustained_loud_20hz))
+    frame_len = 1024   # 64 ms
+    hop = 800          # 50 ms -> 20 Hz
+    n_frames = max(1, (len(v_audio) - frame_len) // hop + 1)
+    hann = np.hanning(frame_len).astype(np.float32)
 
-    # 2. Rhythmic activity via 1.0 - 5.0 Hz envelope modulation (60 - 300 BPM)
-    sos_r = butter(4, [150, 2000], btype="bandpass", fs=SR, output="sos")
-    rhythm_band = sosfiltfilt(sos_r, audio).astype(np.float32)
+    freqs = np.fft.rfftfreq(frame_len, d=1.0 / SR)
+    band_mask = (freqs >= 200.0) & (freqs <= 3800.0)
+    band_freqs = freqs[band_mask].astype(np.float32)
 
-    env_sr = 40  # 40 Hz amplitude envelope (25ms blocks)
+    # Autocorrelation lag range for F0 = 100 Hz .. 695 Hz
+    lag_min, lag_max = 23, 160
+
+    rms_arr = np.zeros(n_frames, dtype=np.float32)
+    voicing_arr = np.zeros(n_frames, dtype=np.float32)
+    pitch_arr = np.zeros(n_frames, dtype=np.float32)
+    centroid_arr = np.zeros(n_frames, dtype=np.float32)
+
+    # Process in chunks to keep RAM tiny even on multi-hour videos
+    chunk_size = 2048
+    for f0 in range(0, n_frames, chunk_size):
+        f1 = min(n_frames, f0 + chunk_size)
+        b = f1 - f0
+        starts = np.arange(f0, f1) * hop
+        idx = starts[:, None] + np.arange(frame_len)[None, :]
+        idx = np.clip(idx, 0, len(v_audio) - 1)
+        frames = v_audio[idx]
+
+        # RMS energy
+        rms_arr[f0:f1] = np.sqrt(np.mean(frames ** 2, axis=1) + 1e-10)
+
+        wframes = frames * hann[None, :]
+
+        # Spectral centroid in 200-3800 Hz
+        spec_p = np.abs(np.fft.rfft(wframes, n=frame_len, axis=1)) ** 2
+        bp = spec_p[:, band_mask]
+        centroid_arr[f0:f1] = np.sum(bp * band_freqs[None, :], axis=1) / (np.sum(bp, axis=1) + 1e-10)
+
+        # Normalized autocorrelation via FFT (padded to 2048 to avoid wrap-around)
+        fft_acf = np.fft.rfft(wframes, n=2048, axis=1)
+        acf = np.fft.irfft(np.abs(fft_acf) ** 2, n=2048, axis=1)[:, : lag_max + 2]
+        acf_norm = acf / (acf[:, 0:1] + 1e-10)
+
+        # Keep only true local maxima inside [lag_min, lag_max] (never the main-lobe slope)
+        mid = acf_norm[:, lag_min : lag_max + 1]
+        left = acf_norm[:, lag_min - 1 : lag_max]
+        right = acf_norm[:, lag_min + 1 : lag_max + 2]
+        is_peak = (mid >= left) & (mid >= right) & (mid > 0.0)
+        masked = np.where(is_peak, mid, 0.0)
+
+        best_rel = np.argmax(masked, axis=1)
+        best_val = masked[np.arange(b), best_rel]
+        best_lag = lag_min + best_rel
+
+        voicing_arr[f0:f1] = np.clip(best_val, 0.0, 1.0)
+        # Log-scaled pitch height (0..1 between ~110 Hz and ~650 Hz), gated by voicing
+        hz = SR / best_lag.astype(np.float32)
+        pitch_norm = np.clip((np.log2(hz) - np.log2(110.0)) / (np.log2(650.0) - np.log2(110.0)), 0.0, 1.0)
+        pitch_arr[f0:f1] = np.where(best_val > 0.30, pitch_norm * best_val, 0.0)
+
+    t_20 = (np.arange(n_frames, dtype=np.float32) * hop + frame_len * 0.5) / SR
+
+    # 1.5s rolling median (30 frames @ 20 Hz) suppresses brief transient pops
+    loud_20 = median_filter(np.log1p(rms_arr * 25.0), size=30)
+    voic_20 = median_filter(voicing_arr, size=20)
+    pitch_20 = median_filter(pitch_arr, size=20)
+    # Gate spectral brightness by voicing so fabric rustle doesn't score high
+    bright_raw = np.clip((centroid_arr - 500.0) / 2200.0, 0.0, 1.0) * (0.2 + 0.8 * voicing_arr)
+    bright_20 = median_filter(bright_raw, size=20)
+
+    loud_out = robust_norm(np.interp(t_grid, t_20, loud_20))
+    voic_out = np.clip(np.interp(t_grid, t_20, voic_20), 0.0, 1.0).astype(np.float32)
+    pitch_out = robust_norm(np.interp(t_grid, t_20, pitch_20))
+    bright_out = robust_norm(np.interp(t_grid, t_20, bright_20))
+    return loud_out, voic_out, pitch_out, bright_out
+
+
+def compute_rhythm_dsp(audio: np.ndarray, t_grid: np.ndarray) -> np.ndarray:
+    """
+    Low-mid rhythmic / periodic impact detector (80-1200 Hz):
+      - 40 Hz log-energy envelope + positive onset flux
+      - 4s sliding window autocorrelation in 0.8-5.0 Hz (48-300 cycles/min)
+      - Combined with sustained energy floor & onset flux density
+    """
+    sos_r = butter(4, [80, 1200], btype="bandpass", fs=SR, output="sos")
+    r_audio = sosfiltfilt(sos_r, audio).astype(np.float32)
+
+    env_sr = 40  # 25 ms blocks
     block = SR // env_sr
-    n_env = len(rhythm_band) // block
-    env = np.sqrt(
-        np.mean(rhythm_band[: n_env * block].reshape(n_env, block) ** 2, axis=1) + 1e-10
-    )
-    env_log = np.log1p(env * 25.0)
+    n_env = max(1, len(r_audio) // block)
+    env = np.sqrt(np.mean(r_audio[: n_env * block].reshape(n_env, block) ** 2, axis=1) + 1e-10)
+    env_log = np.log1p(env * 25.0).astype(np.float32)
 
-    win_sec = 6
-    win_n = win_sec * env_sr
-    hann = np.hanning(win_n)
-    freqs = np.fft.rfftfreq(win_n, d=1.0 / env_sr)
-    mod_mask = (freqs >= 1.0) & (freqs <= 5.0)
+    # Half-wave rectified energy flux (highlights repeating impacts)
+    flux = np.maximum(0.0, np.diff(env_log, prepend=env_log[0])).astype(np.float32)
 
-    rhythm_raw = np.zeros(n_sec, dtype=np.float32)
+    win_n = 4 * env_sr  # 4-second window (160 samples @ 40 Hz)
     half = win_n // 2
-    padded = np.pad(env_log, (half, half), mode="reflect")
+    env_pad = np.pad(env_log, (half, half), mode="reflect")
+    flux_pad = np.pad(flux, (half, half), mode="reflect")
 
-    for sec in range(n_sec):
-        center = min(len(env_log) - 1, int((sec + 0.5) * env_sr))
-        w = padded[center : center + win_n]
-        # 35th percentile measures sustained activity floor (ignores single bumps)
-        sustained_floor = float(np.percentile(w, 35))
-        ac = (w - np.mean(w)) * hann
-        spec = np.abs(np.fft.rfft(ac)) ** 2
-        total_p = float(np.sum(spec[1:]) + 1e-10)
-        mod_spec = spec[mod_mask]
-        # Ratio of 1-5 Hz rhythmic energy + peak sharpness (tonality of rhythm)
-        band_ratio = float(np.sum(mod_spec)) / total_p
-        peak_sharpness = float(np.max(mod_spec)) / (float(np.mean(mod_spec)) + 1e-10)
-        periodicity = band_ratio * min(peak_sharpness / 6.0, 1.5)
-        rhythm_raw[sec] = sustained_floor * periodicity
+    # Autocorrelation lag range: 0.20s (5 Hz / 300 BPM) to 1.25s (0.8 Hz / 48 BPM)
+    lag_min, lag_max = 8, 50
+    fft_n = 512
 
-    rhythm_1hz = robust_norm(gaussian_filter1d(rhythm_raw, sigma=2.0))
-    return vocal_loud_1hz, rhythm_1hz
+    n_out = len(t_grid)
+    periodicity_arr = np.zeros(n_out, dtype=np.float32)
+    vigor_arr = np.zeros(n_out, dtype=np.float32)
+
+    for i, t in enumerate(t_grid):
+        c = min(n_env - 1, int(t * env_sr))
+        w_env = env_pad[c : c + win_n]
+        w_flux = flux_pad[c : c + win_n]
+
+        # Sustained floor (30th percentile kills isolated single impacts)
+        sustained = float(np.percentile(w_env, 30))
+        flux_mean = float(np.mean(w_flux))
+        vigor_arr[i] = 0.45 * sustained + 0.55 * flux_mean
+
+        # Normalized autocorrelation of onset flux
+        ac = w_flux - np.mean(w_flux)
+        if float(np.dot(ac, ac)) < 1e-8:
+            continue
+        f_ac = np.fft.rfft(ac, n=fft_n)
+        acf = np.fft.irfft(np.abs(f_ac) ** 2, n=fft_n)[: lag_max + 2]
+        acf_norm = acf / (acf[0] + 1e-10)
+
+        mid = acf_norm[lag_min : lag_max + 1]
+        left = acf_norm[lag_min - 1 : lag_max]
+        right = acf_norm[lag_min + 1 : lag_max + 2]
+        peaks = np.where((mid >= left) & (mid >= right) & (mid > 0.0), mid, 0.0)
+        periodicity_arr[i] = float(np.max(peaks))
+
+    vigor_norm = robust_norm(vigor_arr)
+    period_norm = robust_norm(periodicity_arr)
+    # Require BOTH rhythmic repetition and physical vigor (quiet ticking won't score high)
+    rhythm_raw = vigor_norm * (0.25 + 0.75 * period_norm)
+    return robust_norm(gaussian_filter1d(rhythm_raw, sigma=2.0))
 
 
 def extract_peaks(score: np.ndarray, vocal: np.ndarray, rhythm: np.ndarray, max_peaks=20):
-    peaks, _ = find_peaks(score, height=0.48, distance=30, prominence=0.14)
+    peaks, _ = find_peaks(
+        score,
+        height=0.46,
+        distance=25 * OUT_HZ,   # >= 25 seconds between distinct peak scenes
+        prominence=0.14,
+    )
     results = []
     n = len(score)
     for idx in peaks:
         val = float(score[idx])
-        thresh = max(0.32, val * 0.60)
+        thresh = max(0.32, val * 0.58)
         s = int(idx)
         while s > 0 and score[s - 1] >= thresh:
             s -= 1
         e = int(idx)
         while e < n - 1 and score[e + 1] >= thresh:
             e += 1
+
+        start_sec = max(0.0, round(s / OUT_HZ - 3.0, 1))  # 3s lead-in before rise
+        end_sec = round(e / OUT_HZ, 1)
         results.append({
-            "t": int(idx),
-            "start": max(0, s - 3),   # 3s lead-in before rise
-            "end": int(e),
+            "t": round(idx / OUT_HZ, 1),
+            "start": start_sec,
+            "end": end_sec,
             "score": round(val, 3),
             "vocal": round(float(np.mean(vocal[s : e + 1])), 3),
             "rhythm": round(float(np.mean(rhythm[s : e + 1])), 3),
         })
+
     results.sort(key=lambda x: x["score"], reverse=True)
     return results[:max_peaks]
 
@@ -217,26 +315,37 @@ def extract_peaks(score: np.ndarray, vocal: np.ndarray, rhythm: np.ndarray, max_
 def analyze_video(playback_id: str, interpreter: Interpreter, labels: list[str]) -> dict:
     audio = fetch_audio_pcm(playback_id)
     duration = len(audio) / SR
-    n_sec = max(1, int(round(duration)))
+    n_pts = max(2, int(round(duration * OUT_HZ)))
+    t_grid = (np.arange(n_pts, dtype=np.float32) + 0.5) / OUT_HZ
 
-    vocal_prob = compute_yamnet_vocal(audio, interpreter, labels, n_sec)
-    vocal_loud, rhythm = compute_dsp_features(audio, n_sec)
+    yamnet_v = compute_yamnet_vocal(audio, interpreter, labels, t_grid)
+    v_loud, voicing, pitch, bright = compute_vocal_dsp(audio, t_grid)
+    rhythm = compute_rhythm_dsp(audio, t_grid)
 
-    # Combine YAMNet vocal confidence with sustained vocal-band loudness
-    vocal = robust_norm(gaussian_filter1d(vocal_prob * (0.35 + 0.65 * vocal_loud), sigma=1.5))
+    # Vocal score: YAMNet + voicing gate, scaled by loudness + pitch height + brightness
+    vocal_gate = np.clip(0.65 * yamnet_v + 0.35 * voicing, 0.0, 1.0)
+    vocal_strength = 0.45 * v_loud + 0.35 * pitch + 0.20 * bright
+    vocal = robust_norm(gaussian_filter1d(vocal_gate * (0.30 + 0.70 * vocal_strength), sigma=1.5))
 
-    # Synergy score: rewards simultaneous rhythmic vigor + strong vocal reactions
-    combined_raw = 0.35 * vocal + 0.25 * rhythm + 0.40 * (vocal * rhythm)
-    score = robust_norm(gaussian_filter1d(combined_raw, sigma=2.5), low=2.0, high=98.0)
+    # Synergy: strongly rewards simultaneous vigorous rhythm + intense vocalizations
+    synergy = 0.35 * vocal + 0.25 * rhythm + 0.40 * (vocal * rhythm)
+    synergy_med = median_filter(synergy, size=3)  # 1.5s median kills brief bumps
+
+    # Continuity boost: reward stretches staying elevated across a 5-second window
+    elevated = (synergy_med > np.percentile(synergy_med, 55)).astype(np.float32)
+    continuity = uniform_filter1d(elevated, size=5 * OUT_HZ)
+    score_raw = synergy_med * (0.65 + 0.35 * continuity)
+
+    # Light smoothing (1.0s sigma) for clean scrubbing
+    score = robust_norm(gaussian_filter1d(score_raw, sigma=2.0), low=2.0, high=98.0)
 
     peaks = extract_peaks(score, vocal, rhythm)
 
-    # Quantize to 0..1000 integers to keep JSON files compact (~20KB per hour)
     return {
         "version": SCHEMA_VERSION,
         "playbackId": playback_id,
         "duration": round(duration, 2),
-        "hz": 1,
+        "hz": OUT_HZ,
         "score": [int(round(v * 1000)) for v in score],
         "vocal": [int(round(v * 1000)) for v in vocal],
         "rhythm": [int(round(v * 1000)) for v in rhythm],
